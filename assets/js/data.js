@@ -2,8 +2,64 @@
 // panels draw. Pure functions only (no DOM), so they run unchanged under `node --test`.
 
 export const HOUR = 3600;
-// Mission Day ran in Zhuhai (Asia/Shanghai, UTC+8, no daylight saving); hours align with UTC hours.
-export const TZ = "Asia/Shanghai";
+const DAY = 86400;
+
+// Each event names its IANA time zone. Offsets come from Intl, so zones with half-hour offsets or
+// daylight saving work too; formatters are cached because the charts ask for thousands of offsets.
+const formatters = new Map();
+function wallClock(timeZone) {
+  let f = formatters.get(timeZone);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    formatters.set(timeZone, f);
+  }
+  return f;
+}
+
+// tzOffset returns the zone's UTC offset in seconds at the instant t (Unix seconds).
+export function tzOffset(timeZone, t) {
+  const whole = Math.floor(t);
+  const p = {};
+  for (const part of wallClock(timeZone).formatToParts(new Date(whole * 1000))) p[part.type] = Number(part.value);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) / 1000 - whole;
+}
+
+// fromWallClock turns local wall-clock seconds (local time written as if it were UTC) into the
+// instant it names. The second pass picks up an offset change between the guess and the answer.
+export function fromWallClock(timeZone, local) {
+  const guess = local - tzOffset(timeZone, local);
+  return local - tzOffset(timeZone, guess);
+}
+
+// localHourStart returns the start of the local hour containing t.
+export function localHourStart(timeZone, t) {
+  const local = t + tzOffset(timeZone, t);
+  return t - (((local % HOUR) + HOUR) % HOUR);
+}
+
+// localMidnight returns the start of the local day containing t.
+export function localMidnight(timeZone, t) {
+  const local = t + tzOffset(timeZone, t);
+  return fromWallClock(timeZone, Math.floor(local / DAY) * DAY);
+}
+
+// offsetLabel writes an offset as "UTC+8", "UTC+5:30" or "UTC-4".
+export function offsetLabel(seconds) {
+  const sign = seconds < 0 ? "-" : "+";
+  const minutes = Math.round(Math.abs(seconds) / 60);
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `UTC${sign}${h}${m ? ":" + String(m).padStart(2, "0") : ""}`;
+}
 
 // parseCSV reads RFC 4180 CSV (quoted fields, doubled quotes, CRLF, optional BOM) into objects
 // keyed by the header row.
@@ -70,8 +126,11 @@ function number(value, name) {
 
 // buildModel aligns every mission on the run timeline. Each run is plotted at its start time, so a
 // run never straddles an hour boundary. A mission missing from a run (failed or skipped reading)
-// keeps its previous value; before its first reading it is null.
-export function buildModel({ runs, snapshots, failures = [], weatherHours = [], weatherCurrent = [], missions }) {
+// keeps its previous value; before its first reading it is null. Hourly figures use the event's
+// local hours.
+export function buildModel({ runs, snapshots, failures = [], weatherHours = [], weatherCurrent = [], missions, timeZone }) {
+  if (typeof timeZone !== "string" || timeZone === "") throw new Error("buildModel needs the event's time zone");
+  wallClock(timeZone); // an unknown zone fails here with a RangeError, not halfway through a chart
   const missionList = [...missions].sort((a, b) => a.order - b.order).map((m) => ({
     guid: m.missionGuid,
     order: m.order,
@@ -141,7 +200,7 @@ export function buildModel({ runs, snapshots, failures = [], weatherHours = [], 
   const hourlyByMission = [];
   let previous = missionList.map(() => null);
   plotted.forEach((run, i) => {
-    const hour = Math.floor(run.t / HOUR) * HOUR;
+    const hour = localHourStart(timeZone, run.t);
     if (hourStarts.length === 0 || hourStarts[hourStarts.length - 1] !== hour) {
       // Fill empty hours so bars and heat-map columns sit on a regular grid.
       for (let h = hourStarts.length ? hourStarts[hourStarts.length - 1] + HOUR : hour; h <= hour; h += HOUR) {
@@ -161,8 +220,10 @@ export function buildModel({ runs, snapshots, failures = [], weatherHours = [], 
     });
   });
 
+  if (n === 0) throw new Error("no run has mission readings");
   const firstActivity = times.find((_, i) => total[i] > 0) ?? times[0];
   return {
+    timeZone,
     missions: missionList,
     runs: runList,
     times,
@@ -189,7 +250,7 @@ export function buildModel({ runs, snapshots, failures = [], weatherHours = [], 
       wind: number(w.wind_speed, "wind_speed"),
     })).sort((a, b) => a.t - b.t),
     // The default view starts an hour before the first completion, skipping the quiet lead-in.
-    extent: { from: Math.max(times[0], Math.floor(firstActivity / HOUR) * HOUR - HOUR), to: times[n - 1] },
+    extent: { from: Math.max(times[0], localHourStart(timeZone, firstActivity) - HOUR), to: times[n - 1] },
   };
 }
 
@@ -275,12 +336,15 @@ export function runStatus(run) {
   return "complete";
 }
 
-// dayPresets lists each local calendar day the data touches, clipped to the data's extent.
-export function dayPresets(extent, offsetSeconds = 8 * HOUR) {
+// dayPresets lists each local calendar day the data touches, clipped to the data's extent. Days
+// are 23 or 25 hours long when daylight saving starts or ends.
+export function dayPresets(extent, timeZone) {
   const presets = [];
-  let dayStart = Math.floor((extent.from + offsetSeconds) / 86400) * 86400 - offsetSeconds;
-  for (; dayStart <= extent.to; dayStart += 86400) {
-    presets.push({ from: Math.max(dayStart, extent.from), to: Math.min(dayStart + 86400 - 1, extent.to), day: dayStart });
+  for (let day = localMidnight(timeZone, extent.from); day <= extent.to; ) {
+    // 36 hours past any midnight is always inside the next local day.
+    const next = localMidnight(timeZone, day + 36 * HOUR);
+    presets.push({ from: Math.max(day, extent.from), to: Math.min(next - 1, extent.to), day });
+    day = next;
   }
   return presets;
 }

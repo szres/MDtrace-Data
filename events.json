@@ -1,0 +1,16 @@
+{
+  "events": [
+    {
+      "slug": "md2026-zhuhai",
+      "name": {
+        "en": "MD 2026 Zhuhai",
+        "zh": "MD 2026 珠海"
+      },
+      "timezone": "Asia/Shanghai",
+      "start": "2026-11-06T08:52:46Z",
+      "end": "2026-11-08T05:00:05Z",
+      "missions": 18,
+      "geo": true
+    }
+  ]
+}

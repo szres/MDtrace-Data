@@ -143,6 +143,8 @@ th button:focus-visible, tr[tabindex]:focus-visible, .seg button:focus-visible {
   background: var(--surface);
   padding: 0 8px;
 }
+.event-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.event-pick select { height: 32px; font-weight: 600; }
 .chips { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .chip {
   display: inline-flex;

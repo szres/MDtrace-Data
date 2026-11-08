@@ -1,20 +1,31 @@
 import uPlot from "../vendor/uplot/uPlot.esm.js";
-import { HOUR, TZ, buildModel, dayPresets, parseCSV, runStatus, summarize, toCSV } from "./data.js";
+import {
+  HOUR,
+  buildModel,
+  dayPresets,
+  fromWallClock,
+  offsetLabel,
+  parseCSV,
+  runStatus,
+  summarize,
+  toCSV,
+  tzOffset,
+} from "./data.js";
 import { describeCondition, translator } from "./i18n.js";
 
-const FILES = {
+// Files of one event, relative to its folder events/<slug>/.
+const DATA_FILES = {
   runs: "data/runs.csv",
   snapshots: "data/snapshots.csv",
   failures: "data/failures.csv",
   weatherHours: "data/weather_hours.csv",
   weatherCurrent: "data/weather_current.csv",
   missions: "data/missions.json",
-  routes: "geo/routes.json",
-  coastline: "geo/coastline.json",
+  detail: "event.json",
 };
+const GEO_FILES = { routes: "geo/routes.json", coastline: "geo/coastline.json" };
 const MAX_FOCUS = 3;
 const SYNC_KEY = "mdtrace";
-const CLUSTER_ORDERS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 const MIN_RANGE = 30 * 60;
 const zhDateNames = {
   MMMM: ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"],
@@ -32,8 +43,10 @@ const state = {
   mapView: "all",
   sort: { key: "order", dir: 1 },
 };
+let events = []; // the published events from events.json, newest first
+let current; // the event on screen: { entry, detail, model, geo, snapshotRows }
 let model;
-let geo;
+const loaded = new Map(); // slug -> promise of a loaded event
 let t = translator("en");
 let cleanups = [];
 let hoveredPlot = null;
@@ -66,9 +79,9 @@ function svg(tag, attrs = {}) {
 const locale = () => (state.lang === "zh" ? "zh-CN" : "en-GB");
 const formatters = new Map();
 function dateFormat(options) {
-  const key = state.lang + JSON.stringify(options);
+  const key = state.lang + model.timeZone + JSON.stringify(options);
   if (!formatters.has(key)) {
-    formatters.set(key, new Intl.DateTimeFormat(locale(), { timeZone: TZ, hourCycle: "h23", ...options }));
+    formatters.set(key, new Intl.DateTimeFormat(locale(), { timeZone: model.timeZone, hourCycle: "h23", ...options }));
   }
   return formatters.get(key);
 }
@@ -90,6 +103,16 @@ function fmtDuration(ms) {
   const minutes = Math.round(ms / 60000);
   return minutes >= 60 ? t("hoursMinutes", { h: Math.floor(minutes / 60), m: minutes % 60 }) : t("minutes", { m: minutes });
 }
+// The event's UTC offset, or both offsets when daylight saving changed during it.
+function offsetText() {
+  const offsets = [model.extent.from, model.extent.to].map((s) => offsetLabel(tzOffset(model.timeZone, s)));
+  return offsets[0] === offsets[1] ? offsets[0] : offsets.join(" / ");
+}
+// Chinese sentences follow each other without a space.
+const sentenceGap = () => (state.lang === "zh" ? "" : " ");
+const localized = (text) => text[state.lang] ?? text.en;
+// Weather is shown for events that name a weather point and collected some readings.
+const hasWeather = () => Boolean(current.detail.weather) && model.weatherHours.length > 0;
 const missionLabel = (m) => `#${String(m.order).padStart(2, "0")} ${m.name}`;
 
 function palette() {
@@ -124,6 +147,12 @@ const focusSlot = (k) => state.focus.find((f) => f.k === k)?.slot;
 
 // ---------- URL state ----------
 
+// hashEvent names the event the URL asks for, falling back to the newest one.
+function hashEvent() {
+  const slug = new URLSearchParams(location.hash.slice(1)).get("event");
+  return events.find((e) => e.slug === slug) ?? events[0];
+}
+
 function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   const lang = params.get("lang");
@@ -133,7 +162,7 @@ function readHash() {
   state.from = model.extent.from;
   state.to = model.extent.to;
   if (Number.isFinite(from) && Number.isFinite(to) && from && to) clampRange(from, to);
-  state.mapView = params.get("map") === "cluster" ? "cluster" : "all";
+  state.mapView = params.get("map") === "cluster" && current.detail.mapFocus ? "cluster" : "all";
   const orders = (params.get("focus") ?? "").split(",").map(Number).filter((n) => Number.isInteger(n) && n > 0);
   const byOrder = new Map(model.missions.map((m, k) => [m.order, k]));
   const picked = params.has("focus")
@@ -144,6 +173,7 @@ function readHash() {
 
 function writeHash() {
   const params = new URLSearchParams();
+  params.set("event", current.entry.slug);
   params.set("from", String(Math.round(state.from)));
   params.set("to", String(Math.round(state.to)));
   params.set("focus", state.focus.map((f) => model.missions[f.k].order).join(","));
@@ -313,7 +343,7 @@ function timePlot(body, { height, x, series, yRange, yFormat, tooltipFor, draw }
   const opts = {
     width: Math.max(200, contentWidth(body)),
     height,
-    tzDate: (ts) => uPlot.tzDate(new Date(ts * 1e3), TZ),
+    tzDate: (ts) => uPlot.tzDate(new Date(ts * 1e3), model.timeZone),
     fmtDate: (tpl) => uPlot.fmtDate(tpl, state.lang === "zh" ? zhDateNames : undefined),
     scales: { x: { time: true, min: state.from, max: state.to }, y: yRange ? { range: yRange } : {} },
     axes: [timeAxis(colors), valueAxis(colors, yFormat)],
@@ -395,9 +425,9 @@ function lastIndexIn(times, values, to) {
 
 function totalPanel() {
   const p = panel({
-    title: t("panelTotal"), info: t("panelTotalInfo"), span: 12,
+    title: t("panelTotal"), info: t("panelTotalInfo", { n: model.missions.length }), span: 12,
     inspect: () => ({
-      header: [t("colTime"), t("colTotal")],
+      header: [t("colTime", { offset: offsetText() }), t("colTotal")],
       rows: model.times.map((s, i) => [s, i]).filter(([s]) => s >= state.from && s <= state.to)
         .map(([s, i]) => [fmtDayTime(s), model.total[i]]),
     }),
@@ -426,7 +456,7 @@ function hourlyPanel(summary) {
   const centers = model.hours.starts.map((h) => h + HOUR / 2);
   const p = panel({
     title: t("panelHourly"), info: t("panelHourlyInfo"), span: 12,
-    inspect: () => ({ header: [t("colHour"), t("colTotal")], rows: summary.hours.map((h) => [fmtHour(h.t), h.added]) }),
+    inspect: () => ({ header: [t("colHour", { offset: offsetText() }), t("colTotal")], rows: summary.hours.map((h) => [fmtHour(h.t), h.added]) }),
   });
   const colors = palette();
   return {
@@ -455,7 +485,7 @@ function missionSeriesPanel(summary, { title, info, values, yRange, format, insp
     inspect: () => {
       const idx = model.times.map((s, i) => [s, i]).filter(([s]) => s >= state.from && s <= state.to);
       return {
-        header: [t("colTime"), ...model.missions.map(missionLabel)],
+        header: [t("colTime", { offset: offsetText() }), ...model.missions.map(missionLabel)],
         rows: idx.map(([s, i]) => [fmtDayTime(s), ...model.missions.map((_, k) => values[k][i])]),
       };
     },
@@ -504,21 +534,22 @@ function missionSeriesPanel(summary, { title, info, values, yRange, format, insp
 }
 
 function weatherPanels(summary) {
+  if (!hasWeather()) return [];
   const hours = model.weatherHours;
-  if (hours.length === 0) return [];
+  const area = localized(current.detail.weather.area);
   const x = hours.map((h) => h.t + HOUR / 2);
   const colors = palette();
   const inRange = () => hours.filter((h) => h.t + HOUR > state.from && h.t <= state.to);
   const temp = panel({
-    title: t("panelTemp"), info: t("panelTempInfo"), span: 12,
+    title: t("panelTemp"), info: t("panelTempInfo", { area }), span: 12,
     inspect: () => ({
-      header: [t("colHour"), t("colTemp"), t("colCondition"), t("colRain")],
+      header: [t("colHour", { offset: offsetText() }), t("colTemp"), t("colCondition"), t("colRain")],
       rows: inRange().map((h) => [fmtHour(h.t), h.temperature, describeCondition(h.condition, state.lang), h.amount]),
     }),
   });
   const rain = panel({
-    title: t("panelRain"), info: t("panelRainInfo"), span: 12,
-    inspect: () => ({ header: [t("colHour"), t("colRain")], rows: inRange().map((h) => [fmtHour(h.t), h.amount]) }),
+    title: t("panelRain"), info: t("panelRainInfo", { area }), span: 12,
+    inspect: () => ({ header: [t("colHour", { offset: offsetText() }), t("colRain")], rows: inRange().map((h) => [fmtHour(h.t), h.amount]) }),
   });
   const weatherRows = (i) => [
     { color: colors.series[0], value: `${fmtNum(hours[i].temperature, 1)} °C`, name: describeCondition(hours[i].condition, state.lang) },
@@ -550,8 +581,8 @@ function weatherPanels(summary) {
 
 // ---------- stat tiles ----------
 
-function statTile(title, value, sub) {
-  const p = panel({ title, span: 4, cls: "stat" });
+function statTile(title, value, sub, span) {
+  const p = panel({ title, span, cls: "stat" });
   p.body.append(el("div", { class: "value" }, value), el("div", { class: "sub" }, sub));
   return { root: p.root };
 }
@@ -560,26 +591,31 @@ function statTiles(summary) {
   const leader = [...summary.missions].sort((a, b) => b.added - a.added)[0];
   const rated = summary.missions.filter((m) => m.ratingEnd !== null).length;
   const w = summary.weather;
-  return [
-    statTile(t("statTotal"), fmtNum(summary.totalEnd), t("statTotalSub", { added: fmtSigned(summary.added) })),
-    statTile(t("statPeak"), summary.peak ? fmtHour(summary.peak.t) : t("none"),
-      summary.peak ? t("statPeakSub", { count: fmtNum(summary.peak.added) }) : t("noData")),
-    statTile(t("statRating"), fmtPct(summary.meanRating), t("statRatingSub", { n: rated })),
-    statTile(t("statLeader"), leader && leader.added > 0 ? missionLabel(leader) : t("none"),
-      leader && leader.added > 0 ? t("statLeaderSub", { count: fmtNum(leader.added) }) : t("noData")),
-    statTile(t("statRuns"), fmtNum(summary.runs.total), t("statRunsSub", { complete: fmtNum(summary.runs.complete), failed: fmtNum(summary.runs.failed) })),
-    statTile(t("statWeather"), w ? `${fmtNum(w.min)}–${fmtNum(w.max)} °C` : t("none"),
-      w ? t("statWeatherSub", { rain: fmtNum(w.rain, 1), hours: w.rainyHours }) : t("noData")),
+  const tiles = [
+    [t("statTotal"), fmtNum(summary.totalEnd), t("statTotalSub", { added: fmtSigned(summary.added) })],
+    [t("statPeak"), summary.peak ? fmtHour(summary.peak.t) : t("none"),
+      summary.peak ? t("statPeakSub", { count: fmtNum(summary.peak.added) }) : t("noData")],
+    [t("statRating"), fmtPct(summary.meanRating), t("statRatingSub", { n: rated })],
+    [t("statLeader"), leader && leader.added > 0 ? missionLabel(leader) : t("none"),
+      leader && leader.added > 0 ? t("statLeaderSub", { count: fmtNum(leader.added) }) : t("noData")],
+    [t("statRuns"), fmtNum(summary.runs.total), t("statRunsSub", { complete: fmtNum(summary.runs.complete), failed: fmtNum(summary.runs.failed) })],
   ];
+  if (hasWeather()) {
+    tiles.push([t("statWeather"), w ? `${fmtNum(w.min)}–${fmtNum(w.max)} °C` : t("none"),
+      w ? t("statWeatherSub", { rain: fmtNum(w.rain, 1), hours: w.rainyHours }) : t("noData")]);
+  }
+  // The tiles share the 24-column row; any remainder widens the first ones.
+  const base = Math.floor(24 / tiles.length);
+  return tiles.map(([title, value, sub], i) => statTile(title, value, sub, base + (i < 24 % tiles.length ? 1 : 0)));
 }
 
 // ---------- pace heat map (canvas) ----------
 
-function pacePanel(summary) {
+function pacePanel(summary, span) {
   const p = panel({
-    title: t("panelPace"), info: t("panelPaceInfo"), span: 14,
+    title: t("panelPace"), info: t("panelPaceInfo"), span,
     inspect: () => ({
-      header: [t("colHour"), ...model.missions.map(missionLabel)],
+      header: [t("colHour", { offset: offsetText() }), ...model.missions.map(missionLabel)],
       rows: summary.hours.map((h) => [fmtHour(h.t), ...h.byMission]),
     }),
   });
@@ -626,7 +662,10 @@ function pacePanel(summary) {
     // Label whole local hours that are a multiple of `every`, keeping at least 64px between labels.
     const every = [1, 2, 3, 4, 6, 8, 12, 24].find((n) => n * cellW >= 64) ?? 24;
     const ticks = summary.hours.map((h, j) => j)
-      .filter((j) => (Math.floor((summary.hours[j].t + 8 * HOUR) / HOUR) % 24) % every === 0);
+      .filter((j) => {
+        const h = summary.hours[j].t;
+        return (Math.floor((h + tzOffset(model.timeZone, h)) / HOUR) % 24) % every === 0;
+      });
     if (ticks.length === 0 || ticks[0] >= every) ticks.unshift(0);
     const days = ticks.map((j) => fmtDay(summary.hours[j].t));
     const showDay = dayLabelPositions(days, ticks.map((j) => j * cellW));
@@ -655,11 +694,17 @@ function pacePanel(summary) {
 // ---------- map (SVG) ----------
 
 function mapPanel(summary) {
-  const seg = el("div", { class: "seg", role: "group" },
-    ["all", "cluster"].map((view) => el("button", {
+  const { geo, detail } = current;
+  const focus = detail.mapFocus;
+  const views = [["all", t("mapAll", { n: model.missions.length })]];
+  if (focus) views.push(["cluster", localized(focus.label)]);
+  const seg = views.length > 1
+    ? el("div", { class: "seg", role: "group" }, views.map(([view, label]) => el("button", {
       type: "button", "aria-pressed": String(state.mapView === view),
       onclick: () => { state.mapView = view; update(); },
-    }, t(view === "all" ? "mapAll" : "mapCluster"))));
+    }, label)))
+    : null;
+  const focusOrders = new Set(focus?.orders ?? []);
   const p = panel({
     title: t("panelMap"), info: t("panelMapInfo"), span: 10, cls: "map", actions: [seg],
     inspect: () => ({
@@ -668,7 +713,7 @@ function mapPanel(summary) {
     }),
   });
   const colors = palette();
-  const routes = geo.routes.filter((r) => state.mapView === "all" || CLUSTER_ORDERS.has(r.order));
+  const routes = geo.routes.filter((r) => state.mapView === "all" || focusOrders.has(r.order));
   const byGuid = new Map(summary.missions.map((m) => [m.guid, m]));
   const max = Math.max(1, ...routes.map((r) => byGuid.get(r.missionGuid)?.added ?? 0));
   p.legend.append(el("span", {}, t("low"), el("span", { class: "ramp", style: { background: `linear-gradient(90deg, ${colors.seq.slice(2).join(",")})` } }),
@@ -739,7 +784,7 @@ function healthPanel() {
   const p = panel({
     title: t("panelHealth"), info: t("panelHealthInfo"),
     inspect: () => ({
-      header: [t("colRun"), t("colTime"), t("colStatus"), t("colMissionsOk"), t("colError")],
+      header: [t("colRun"), t("colTime", { offset: offsetText() }), t("colStatus"), t("colMissionsOk"), t("colError")],
       rows: runs.map((r) => [r.id, fmtDayTime(r.t), t(runStatus(r)), `${r.ok}/${r.total}`, r.error || (r.skipped ? t("skippedReadings", { n: r.skipped }) : "")]),
     }),
   });
@@ -839,13 +884,19 @@ function tablePanel(summary) {
 
 function downloadsPanel() {
   const p = panel({ title: t("panelDownloads"), cls: "downloads" });
+  const dir = eventDir(current.entry.slug);
   const files = [
-    ["data/snapshots.csv", "fileSnapshots"], ["data/runs.csv", "fileRuns"], ["data/failures.csv", "fileFailures"],
-    ["data/weather_hours.csv", "fileWeatherHours"], ["data/weather_current.csv", "fileWeatherCurrent"],
-    ["data/mdtrace.sqlite", "fileSqlite"], ["data/missions.json", "fileMissions"], ["geo/routes.json", "fileRoutes"],
+    ["data/snapshots.csv", t("fileSnapshots", { rows: fmtNum(current.snapshotRows) })],
+    ["data/runs.csv", t("fileRuns")], ["data/failures.csv", t("fileFailures")],
+    ["data/weather_hours.csv", t("fileWeatherHours")], ["data/weather_current.csv", t("fileWeatherCurrent")],
+    ["data/mdtrace.sqlite", t("fileSqlite")], ["data/missions.json", t("fileMissions")], ["event.json", t("fileEvent")],
   ];
-  p.body.append(el("p", {}, t("downloadsIntro")),
-    el("ul", {}, files.map(([href, key]) => el("li", {}, el("a", { href }, href), ` — ${t(key)}`))));
+  if (current.geo) files.push(["geo/routes.json", t("fileRoutes")]);
+  const credits = [t("downloadsIntro")];
+  if (hasWeather()) credits.push(t("creditWeather"));
+  if (current.geo) credits.push(t("creditCoastline"));
+  p.body.append(el("p", {}, credits.join(sentenceGap())),
+    el("ul", {}, files.map(([path, label]) => el("li", {}, el("a", { href: dir + path }, dir + path), ` — ${label}`))));
   return { root: p.root };
 }
 
@@ -854,11 +905,15 @@ function downloadsPanel() {
 function rangeControl() {
   const presets = [
     { label: t("wholeEvent"), from: model.extent.from, to: model.extent.to },
-    ...dayPresets(model.extent).map((d) => ({ label: fmtDay(d.day), from: d.from, to: d.to })),
+    ...dayPresets(model.extent, model.timeZone).map((d) => ({ label: fmtDay(d.day), from: d.from, to: d.to })),
     ...[6, 12, 24].map((hours) => ({ label: t("last", { hours }), from: model.extent.to - hours * HOUR, to: model.extent.to })),
   ];
-  const toLocalInput = (s) => new Date((s + 8 * HOUR) * 1000).toISOString().slice(0, 16);
-  const fromLocalInput = (v) => Date.parse(`${v}:00Z`) / 1000 - 8 * HOUR;
+  // datetime-local inputs hold the event's wall-clock time, written here as if it were UTC.
+  const toLocalInput = (s) => new Date((s + tzOffset(model.timeZone, s)) * 1000).toISOString().slice(0, 16);
+  const fromLocalInput = (v) => {
+    const local = Date.parse(`${v}:00Z`) / 1000;
+    return Number.isFinite(local) ? fromWallClock(model.timeZone, local) : NaN;
+  };
   const fromInput = el("input", { type: "datetime-local", value: toLocalInput(state.from), min: toLocalInput(model.extent.from), max: toLocalInput(model.extent.to) });
   const toInput = el("input", { type: "datetime-local", value: toLocalInput(state.to), min: toLocalInput(model.extent.from), max: toLocalInput(model.extent.to) });
   const popover = el("div", { class: "popover", hidden: true, role: "menu" },
@@ -916,6 +971,17 @@ function focusControl() {
     state.focus.length ? el("button", { class: "btn", type: "button", onclick: () => { state.focus = []; update(); } }, t("clearFocus")) : null);
 }
 
+// eventControl switches between published events; a new event starts with its own defaults.
+function eventControl() {
+  if (events.length < 2) return null;
+  return el("label", { class: "event-pick" }, el("span", { class: "muted" }, t("event")),
+    el("select", {
+      onchange: (event) => {
+        location.hash = new URLSearchParams({ event: event.target.value, lang: state.lang }).toString();
+      },
+    }, events.map((e) => el("option", { value: e.slug, selected: e.slug === current.entry.slug }, localized(e.name)))));
+}
+
 function effectiveTheme() {
   const set = document.documentElement.dataset.theme;
   if (set === "light" || set === "dark") return set;
@@ -945,7 +1011,7 @@ function renderControls() {
     },
   }, effectiveTheme() === "dark" ? t("themeLight") : t("themeDark"));
   document.getElementById("controls").replaceChildren(
-    rangeControl(), zoomOut, el("span", { class: "hint" }, t("zoomHint")), focusControl(),
+    eventControl(), rangeControl(), zoomOut, el("span", { class: "hint" }, t("zoomHint")), focusControl(),
     el("span", { class: "spacer" }), lang, theme);
 }
 
@@ -963,11 +1029,15 @@ function render() {
   hideTooltip();
   t = translator(state.lang);
   document.documentElement.lang = state.lang === "zh" ? "zh-CN" : "en";
-  document.title = t("title");
-  document.getElementById("title").textContent = t("title");
-  document.getElementById("lede").textContent = `${t("subtitle")}. ${t("times")}`;
-  document.getElementById("footer").replaceChildren(t("footer"), " · ",
-    el("a", { href: "https://weatherkit.apple.com/legal-attribution.html", rel: "noopener" }, t("weatherAttribution")), " · ",
+  const title = t("title", { event: localized(current.entry.name) });
+  document.title = title;
+  document.getElementById("title").textContent = title;
+  document.getElementById("lede").textContent =
+    `${t("subtitle", { n: model.missions.length })}${sentenceGap()}${t("times", { zone: model.timeZone, offset: offsetText() })}`;
+  const weatherCredit = hasWeather()
+    ? [el("a", { href: "https://weatherkit.apple.com/legal-attribution.html", rel: "noopener" }, t("weatherAttribution")), " · "]
+    : [];
+  document.getElementById("footer").replaceChildren(t("footer"), " · ", ...weatherCredit,
     el("a", { href: "https://github.com/szres/MDtrace-Data", rel: "noopener" }, t("sourceLink")));
   renderControls();
 
@@ -984,13 +1054,13 @@ function render() {
       title: t("panelRatings"), info: t("panelRatingsInfo"), values: model.ratings,
       yRange: () => [0, 100], format: (v) => fmtPct(v, 0),
     }),
-    pacePanel(summary),
-    mapPanel(summary),
+    pacePanel(summary, current.geo ? 14 : 24),
+    current.geo ? mapPanel(summary) : null,
     ...weatherPanels(summary),
     healthPanel(),
     tablePanel(summary),
     downloadsPanel(),
-  ];
+  ].filter(Boolean);
   const grid = document.getElementById("grid");
   grid.replaceChildren(...panels.map((p) => p.root));
   for (const p of panels) p.mount?.();
@@ -1008,33 +1078,72 @@ async function fetchText(path) {
   return response.text();
 }
 
+const eventDir = (slug) => `events/${encodeURIComponent(slug)}/`;
+
+async function fetchFiles(dir, files) {
+  const entries = await Promise.all(Object.entries(files).map(async ([key, path]) => [key, await fetchText(dir + path)]));
+  return Object.fromEntries(entries);
+}
+
+async function loadEvent(entry) {
+  const dir = eventDir(entry.slug);
+  const [raw, geoRaw] = await Promise.all([fetchFiles(dir, DATA_FILES), entry.geo ? fetchFiles(dir, GEO_FILES) : null]);
+  const detail = JSON.parse(raw.detail);
+  if (detail.slug !== entry.slug) throw new Error(`${dir}event.json names ${detail.slug}`);
+  const snapshots = parseCSV(raw.snapshots);
+  return {
+    entry,
+    detail,
+    snapshotRows: snapshots.length,
+    model: buildModel({
+      timeZone: detail.timezone,
+      runs: parseCSV(raw.runs),
+      snapshots,
+      failures: parseCSV(raw.failures),
+      weatherHours: parseCSV(raw.weatherHours),
+      weatherCurrent: parseCSV(raw.weatherCurrent),
+      missions: JSON.parse(raw.missions).missions,
+    }),
+    geo: geoRaw && { routes: JSON.parse(geoRaw.routes).routes, coastline: JSON.parse(geoRaw.coastline) },
+  };
+}
+
+// showEvent loads the event the URL names (once per page view) and draws it. A slower earlier
+// load never replaces a newer choice.
+let shown = 0;
+async function showEvent() {
+  const entry = hashEvent();
+  const ticket = ++shown;
+  if (current?.entry.slug !== entry.slug) {
+    if (!loaded.has(entry.slug)) {
+      loaded.set(entry.slug, loadEvent(entry));
+      loaded.get(entry.slug).catch(() => loaded.delete(entry.slug));
+    }
+    if (current) document.getElementById("grid").replaceChildren(el("div", { class: "banner" }, t("loading")));
+    const next = await loaded.get(entry.slug);
+    if (ticket !== shown) return;
+    current = next;
+    model = next.model;
+    state.sort = { key: "order", dir: 1 };
+  }
+  readHash();
+  writeHash();
+  render();
+}
+
 async function main() {
   window.addEventListener("error", (event) => showError(event.error ?? event.message));
   window.addEventListener("unhandledrejection", (event) => showError(event.reason));
   const status = document.getElementById("status");
   t = translator(navigator.language?.startsWith("zh") ? "zh" : "en");
   status.textContent = t("loading");
-  const entries = await Promise.all(Object.entries(FILES).map(async ([key, path]) => [key, await fetchText(path)]));
-  const raw = Object.fromEntries(entries);
-  model = buildModel({
-    runs: parseCSV(raw.runs),
-    snapshots: parseCSV(raw.snapshots),
-    failures: parseCSV(raw.failures),
-    weatherHours: parseCSV(raw.weatherHours),
-    weatherCurrent: parseCSV(raw.weatherCurrent),
-    missions: JSON.parse(raw.missions).missions,
-  });
-  geo = { routes: JSON.parse(raw.routes).routes, coastline: JSON.parse(raw.coastline) };
-  readHash();
-  writeHash();
-  render();
+  events = JSON.parse(await fetchText("events.json")).events;
+  if (!Array.isArray(events) || events.length === 0) throw new Error("events.json lists no events");
+  await showEvent();
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
     if (!document.documentElement.dataset.theme) render();
   });
-  window.addEventListener("hashchange", () => {
-    readHash();
-    render();
-  });
+  window.addEventListener("hashchange", () => showEvent().catch(showError));
   document.documentElement.dataset.ready = "true";
 }
 
