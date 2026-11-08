@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MD 2026 Zhuhai · MDTrace</title>
+  <meta name="description" content="Completions, ratings, pace, map and weather of the 18 MD 2026 Zhuhai Ingress missions, collected every 5 minutes from Ingress Intel.">
+  <link rel="stylesheet" href="assets/vendor/uplot/uPlot.min.css">
+  <link rel="stylesheet" href="assets/css/dashboard.css">
+  <script>
+    // Apply a saved theme before first paint; storage may be unavailable (private mode).
+    try {
+      const theme = localStorage.getItem("mdtrace-theme");
+      if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+    } catch (e) {}
+  </script>
+  <script type="module" src="assets/js/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1 id="title">MD 2026 Zhuhai · Mission tracker</h1>
+    <p class="lede" id="lede"></p>
+    <div class="controls" id="controls"></div>
+  </header>
+  <main class="grid" id="grid">
+    <div class="banner" id="status">Loading data…</div>
+  </main>
+  <footer id="footer"></footer>
+  <div id="tooltip" role="tooltip" hidden></div>
+  <dialog id="inspect" aria-labelledby="inspect-title">
+    <header>
+      <h2 id="inspect-title"></h2>
+      <button class="btn" id="inspect-download" type="button"></button>
+      <button class="btn" id="inspect-close" type="button"></button>
+    </header>
+    <div class="table-wrap"><table id="inspect-table"></table></div>
+  </dialog>
+</body>
+</html>

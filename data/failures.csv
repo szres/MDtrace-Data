@@ -1,0 +1,13 @@
+run_id,mission_guid,error,failed_at
+285,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:20:11Z
+286,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:25:11Z
+287,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:30:11Z
+288,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:35:10Z
+289,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:40:10Z
+290,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:45:08Z
+291,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:50:11Z
+292,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T12:55:11Z
+293,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T13:00:11Z
+294,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T13:05:10Z
+295,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T13:10:10Z
+296,21d75a9229b040ada1c0ada18545074b.1c,"intel returned zeroed stats (completed 0 after 204); reading skipped",2026-11-07T13:15:11Z
