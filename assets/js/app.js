@@ -1010,9 +1010,9 @@ function renderControls() {
       update();
     },
   }, effectiveTheme() === "dark" ? t("themeLight") : t("themeDark"));
-  document.getElementById("controls").replaceChildren(
-    eventControl(), rangeControl(), zoomOut, el("span", { class: "hint" }, t("zoomHint")), focusControl(),
-    el("span", { class: "spacer" }), lang, theme);
+  const controls = [eventControl(), rangeControl(), zoomOut, el("span", { class: "hint" }, t("zoomHint")), focusControl(),
+    el("span", { class: "spacer" }), lang, theme];
+  document.getElementById("controls").replaceChildren(...controls.filter(Boolean));
 }
 
 // ---------- render ----------
